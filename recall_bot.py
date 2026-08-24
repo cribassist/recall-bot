@@ -33,7 +33,7 @@ from requests_oauthlib import OAuth1
 CPSC_URL = "https://www.saferproducts.gov/RestWebServices/Recall"
 STATE_FILE = "post_state.json"
 
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 3
 INCLUDE_LINK = False
 MAX_POSTS_PER_RUN = 5
 
