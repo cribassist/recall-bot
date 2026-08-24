@@ -30,12 +30,12 @@ STATE_FILE = "post_state.json"
 
 # How far back to look each run. The workflow runs every 6 hours, so 2 days
 # gives generous overlap in case a run is skipped or delayed.
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 3
 
 # Toggle: include the official recall URL in the tweet.
 # ON  -> more useful/actionable, but costs ~$0.20/post on X's API (link pricing)
 # OFF -> cheaper (~$0.015/post), text-only, still names product + hazard + remedy
-INCLUDE_LINK = True
+INCLUDE_LINK = False
 
 # Safety cap so a bad run can never blow the whole budget in one shot.
 MAX_POSTS_PER_RUN = 5
