@@ -57,9 +57,14 @@ def save_posted_ids(ids):
 def fetch_recent_recalls():
     start = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%m/%d/%Y")
     params = {"RecallDateStart": start, "format": "json"}
-    resp = requests.get(CPSC_URL, params=params, timeout=30)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    resp = requests.get(CPSC_URL, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
 
 
 def first_name(items, key="Name", fallback="See recall notice"):
