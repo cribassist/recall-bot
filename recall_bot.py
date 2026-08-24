@@ -2,8 +2,9 @@
 CPSC Recall Bot
 ----------------
 Pulls new product recalls from the official CPSC (SaferProducts.gov) REST API
-and posts them to X. No API key needed for CPSC — it's a fully public,
-official government endpoint.
+and posts them to X, formatted with a category tag, a severity-based urgency
+flag, and a short attention-grabbing hook (AI-generated via Claude Haiku,
+with a free template fallback if that call ever fails or the key is missing).
 
 State (which recalls have already been posted) is tracked in post_state.json,
 which this script updates and the GitHub Action commits back to the repo
@@ -15,6 +16,10 @@ Env vars required (set as GitHub Actions secrets):
     X_API_SECRET
     X_ACCESS_TOKEN
     X_ACCESS_SECRET
+
+Env var optional (enables the AI hook line; falls back to a template if unset
+or if the call fails for any reason):
+    ANTHROPIC_API_KEY
 """
 
 import json
@@ -28,18 +33,128 @@ from requests_oauthlib import OAuth1
 CPSC_URL = "https://www.saferproducts.gov/RestWebServices/Recall"
 STATE_FILE = "post_state.json"
 
-# How far back to look each run. The workflow runs every 6 hours, so 2 days
-# gives generous overlap in case a run is skipped or delayed.
 LOOKBACK_DAYS = 3
-
-# Toggle: include the official recall URL in the tweet.
-# ON  -> more useful/actionable, but costs ~$0.20/post on X's API (link pricing)
-# OFF -> cheaper (~$0.015/post), text-only, still names product + hazard + remedy
 INCLUDE_LINK = False
-
-# Safety cap so a bad run can never blow the whole budget in one shot.
 MAX_POSTS_PER_RUN = 5
 
+CPSC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+# ---------------------------------------------------------------------------
+# Categorization — free, keyword-based, no API calls
+# ---------------------------------------------------------------------------
+
+CATEGORIES = [
+    # (label, emoji, keywords to match against the recall's text)
+    ("VEHICLE RECALL", "🚗", ["motorcycle", "vehicle", "atv", "scooter", "bicycle",
+                               "e-bike", "moped", "truck", "trailer"]),
+    ("BABY & KID SAFETY", "👶", ["infant", "child", "children", "baby", "toddler",
+                                  "crib", "stroller", "toy", "bassinet", "car seat"]),
+    ("FOOD RECALL", "🍔", ["food", "beverage", "snack", "meat", "produce"]),
+    ("AMAZON RECALL", "🛒", ["amazon"]),
+]
+
+CLOSING_QUESTIONS = {
+    "VEHICLE RECALL": "Could this affect your ride?",
+    "BABY & KID SAFETY": "Do you have this in your home?",
+    "FOOD RECALL": "Check your pantry — do you have this?",
+    "AMAZON RECALL": "Bought this on Amazon? Check your orders.",
+    "GENERAL": "Do you own this product?",
+}
+
+FALLBACK_HOOKS = {
+    "VEHICLE RECALL": "🚨 Check your ride before you drive it.",
+    "BABY & KID SAFETY": "🚨 Parents — check your home for this one.",
+    "FOOD RECALL": "⚠️ Check your pantry before you eat this.",
+    "AMAZON RECALL": "🚨 Bought this on Amazon? Read this.",
+    "GENERAL": "🚨 This product was just recalled.",
+}
+
+# Tier A = high-urgency hazard language; anything else defaults to Tier B.
+TIER_A_KEYWORDS = [
+    "death", "fire", "burn", "explosion", "crash", "laceration", "impact",
+    "choking", "ingestion", "battery", "brake", "steering", "electrocution",
+    "shock", "carbon monoxide", "strangulation", "suffocation", "amputation",
+]
+
+
+def searchable_text(recall):
+    parts = [recall.get("Title", "")]
+    for hazard in recall.get("Hazards", []) or []:
+        parts.append(hazard.get("Name", ""))
+    for product in recall.get("Products", []) or []:
+        parts.append(product.get("Name", ""))
+    for retailer in recall.get("Retailers", []) or []:
+        parts.append(retailer.get("Name", ""))
+    return " ".join(parts).lower()
+
+
+def categorize(recall):
+    text = searchable_text(recall)
+    for label, emoji, keywords in CATEGORIES:
+        if any(kw in text for kw in keywords):
+            return label, emoji
+    return "GENERAL", "🚨"
+
+
+def tier_of(recall):
+    text = searchable_text(recall)
+    return "A" if any(kw in text for kw in TIER_A_KEYWORDS) else "B"
+
+
+# ---------------------------------------------------------------------------
+# AI hook line — small Claude Haiku call, with a free fallback
+# ---------------------------------------------------------------------------
+
+def generate_hook(category_label, product, hazard):
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return FALLBACK_HOOKS.get(category_label, FALLBACK_HOOKS["GENERAL"])
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 40,
+                "system": (
+                    "Write ONE short, punchy, scroll-stopping opening line for a "
+                    "product recall alert tweet. Under 70 characters. No hashtags, "
+                    "no quotation marks, no emoji beyond one at the very start. "
+                    "Output only the line itself, nothing else."
+                ),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Category: {category_label}\n"
+                            f"Product: {product}\n"
+                            f"Hazard: {hazard}"
+                        ),
+                    }
+                ],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        text = resp.json()["content"][0]["text"].strip()
+        return text if text else FALLBACK_HOOKS.get(category_label, FALLBACK_HOOKS["GENERAL"])
+    except Exception as e:
+        print(f"Hook generation failed, using fallback: {e}", file=sys.stderr)
+        return FALLBACK_HOOKS.get(category_label, FALLBACK_HOOKS["GENERAL"])
+
+
+# ---------------------------------------------------------------------------
+# State handling
+# ---------------------------------------------------------------------------
 
 def load_posted_ids():
     if not os.path.exists(STATE_FILE):
@@ -54,42 +169,74 @@ def save_posted_ids(ids):
         json.dump({"posted_ids": sorted(ids)}, f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# CPSC fetch
+# ---------------------------------------------------------------------------
+
 def fetch_recent_recalls():
     start = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%m/%d/%Y")
     params = {"RecallDateStart": start, "format": "json"}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
-    resp = requests.get(CPSC_URL, params=params, headers=headers, timeout=30)
+    resp = requests.get(CPSC_URL, params=params, headers=CPSC_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
-
 def first_name(items, key="Name", fallback="See recall notice"):
-    """Safely grab the first item's Name field from a list the CPSC API returns."""
     if isinstance(items, list) and items:
         return items[0].get(key, fallback)
     return fallback
 
 
+# ---------------------------------------------------------------------------
+# Tweet formatting
+# ---------------------------------------------------------------------------
+
+def truncate(text, max_len):
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
 def format_tweet(recall):
-    title = recall.get("Title", "Product Recall")
-    hazard = first_name(recall.get("Hazards", []))
-    remedy = first_name(recall.get("Remedies", []))
+    category_label, category_emoji = categorize(recall)
+    tier = tier_of(recall)
+    tier_flag = "🚨" if tier == "A" else "⚠️"
+
+    product = truncate(recall.get("Title", "Product Recall"), 100)
+    hazard = truncate(first_name(recall.get("Hazards", [])), 60)
+    remedy = truncate(first_name(recall.get("Remedies", [])), 60)
     url = recall.get("URL", "")
 
-    body = f"⚠️ RECALL: {title}\n\nHazard: {hazard}\nRemedy: {remedy}"
+    hook = generate_hook(category_label, product, hazard)
+    closing = CLOSING_QUESTIONS.get(category_label, CLOSING_QUESTIONS["GENERAL"])
 
-    if INCLUDE_LINK and url:
-        body += f"\n\n{url}"
+    # Build in priority order, dropping the lowest-priority piece first if
+    # we run over the character limit: closing question, then remedy line.
+    header = f"{tier_flag} {category_emoji} {category_label}"
 
-    # Hard safety trim to X's character limit.
-    if len(body) > 280:
-        body = body[:277] + "..."
-    return body
+    def assemble(include_closing=True, include_remedy=True):
+        lines = [header, "", hook, "", f"Product: {product}", f"Hazard: {hazard}"]
+        if include_remedy:
+            lines.append(f"Remedy: {remedy}")
+        if INCLUDE_LINK and url:
+            lines += ["", url]
+        if include_closing:
+            lines += ["", closing]
+        return "\n".join(lines)
 
+    text = assemble()
+    if len(text) > 280:
+        text = assemble(include_closing=False)
+    if len(text) > 280:
+        text = assemble(include_closing=False, include_remedy=False)
+    if len(text) > 280:
+        text = text[:277] + "..."
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Posting
+# ---------------------------------------------------------------------------
 
 def post_to_x(text, auth):
     resp = requests.post(
